@@ -12,8 +12,7 @@ def main_menu():
         run_squat_live()
 
     elif choice == "2":
-        #video_path = input("Enter video path: ").strip()
-        video_path = ("C:\\Users\\Yuval\\Desktop\\Rupin\\Year 4\\Final Project\\LastYearProject_FitVisor\\Media\\SquatYarin.mov").strip()
+        video_path = input("Enter video path: ").strip()     
         run_squat_on_video(video_path)
 
     elif choice == "3":
