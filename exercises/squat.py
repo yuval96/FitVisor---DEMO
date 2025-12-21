@@ -8,16 +8,23 @@ mp_drawing = mp.solutions.drawing_utils
 
 IDX = {
     "L_HIP": mp_pose.PoseLandmark.LEFT_HIP.value,
-    "L_KNEE": mp_pose.PoseLandmark.LEFT_KNEE.value,
-    "L_ANKLE": mp_pose.PoseLandmark.LEFT_ANKLE.value,
-    "L_SH": mp_pose.PoseLandmark.LEFT_SHOULDER.value,
-    "R_SH": mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
     "R_HIP": mp_pose.PoseLandmark.RIGHT_HIP.value,
+    "L_KNEE": mp_pose.PoseLandmark.LEFT_KNEE.value,
+    "R_KNEE": mp_pose.PoseLandmark.RIGHT_KNEE.value,
+    "L_ANKLE": mp_pose.PoseLandmark.LEFT_ANKLE.value,
+    "R_ANKLE": mp_pose.PoseLandmark.RIGHT_ANKLE.value,
+    "L_HEEL": mp_pose.PoseLandmark.LEFT_HEEL.value,
+    "R_HEEL": mp_pose.PoseLandmark.RIGHT_HEEL.value,
+    "L_FOOT_INDEX": mp_pose.PoseLandmark.LEFT_FOOT_INDEX.value,
+    "R_FOOT_INDEX": mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value,
+    "L_SH": mp_pose.PoseLandmark.LEFT_SHOULDER.value,
+    "R_SH": mp_pose.PoseLandmark.RIGHT_SHOULDER.value
 }
 
 SQUAT_DOWN_ANGLE = 100
 SQUAT_UP_ANGLE = 160
 TORSO_OK_ANGLE = 35
+KNEE_TRACK_THRESHOLD = 0.5 # knee over foot alignment threshold
 
 
 def get_joint_xy(lm, idx, w, h):
@@ -44,6 +51,30 @@ def compute_torso_angle(lm, w, h):
 
     angle_deg = float(np.degrees(np.arccos(cos_theta)))
     return angle_deg, mid_sh, mid_hip
+
+# Check knee over foot alignment
+def get_closer_leg(lm):
+    left_knee_z = lm[IDX["L_KNEE"]].z
+    right_knee_z = lm[IDX["R_KNEE"]].z
+
+    # more negative z = closer to camera
+    return "left" if left_knee_z < right_knee_z else "right"
+
+def knee_over_foot(lm, side="left", tolerance=0.04):
+    if side == "left":
+        knee = lm[IDX["L_KNEE"]]
+        foot = lm[IDX["L_FOOT_INDEX"]]
+        return knee.x < foot.x
+    else:
+        knee = lm[IDX["R_KNEE"]]
+        foot = lm[IDX["R_FOOT_INDEX"]]
+        return knee.x > foot.x
+    
+# Status of knee tracking
+def knee_tracking_status(sideBad):
+    ok = not sideBad
+    return ("OK" if ok else "MISALIGNED"), ((0, 255, 0) if ok else (0, 0, 255))
+###
 
 
 def update_rep_count(knee_angle, stage, count):
@@ -94,11 +125,34 @@ def process_frame(frame, pose, stage, reps, mirror=False, draw_reps=True):
     knee_angle = calculate_angle(hip, knee, ankle)
     torso_angle, mid_sh, mid_hip = compute_torso_angle(lm, w, h)
 
+    ## knee tracking
+    closer_leg = get_closer_leg(lm)
+
+    if closer_leg == "left":
+        left_bad = knee_over_foot(lm, "left")
+        left_status, left_color = knee_tracking_status(left_bad)
+
+        right_status, right_color = "N/A", (180, 180, 180)
+    else:
+        right_bad = knee_over_foot(lm, "right")
+        right_status, right_color = knee_tracking_status(right_bad)
+
+        left_status, left_color = "N/A", (180, 180, 180)
+
     stage, reps = update_rep_count(knee_angle, stage, reps)
     _, color = torso_status(torso_angle)
 
     if draw_reps:
         draw_overlay(frame, knee_angle, torso_angle, reps, mid_sh, mid_hip, color)
+
+        # Draw knee tracking status
+        cv2.putText(frame, f"L Knee: {left_status}", (10, 190),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, left_color, 2)
+
+        cv2.putText(frame, f"R Knee: {right_status}", (10, 230),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, right_color, 2)
+        ##
+
     else:
         cv2.putText(frame, f"Angle: {int(knee_angle)}", (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -126,7 +180,7 @@ def run_squat_live():
             if not ret:
                 break
 
-            frame, stage, reps, _ = process_frame(frame, pose, stage, reps, mirror=True, draw_reps=True)
+            frame, stage, reps, _ = process_frame(frame, pose, stage, reps, mirror=False, draw_reps=True)
             cv2.imshow("FitVisor - Live Squats", frame)
 
             if cv2.waitKey(1) & 0xFF == 27:
@@ -176,3 +230,4 @@ def run_squat_on_image(image_path):
         cv2.imshow("FitVisor - Image Squat Analysis", image)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
+
