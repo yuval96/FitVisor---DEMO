@@ -6,21 +6,34 @@ from utils.angles import calculate_angle
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
+# ==========================
+# PUSH-UP DETECTION SETTINGS
+# ==========================
+PUSHUP_DOWN_ANGLE = 90
+PUSHUP_UP_ANGLE = 160
+
+# Plank check (kept same logic you had: hip->shoulder vs vertical)
+PLANK_OK_ANGLE = 20
+
+# Arm-to-torso check at shoulder: elbow-shoulder-hip should be ~45 deg
+ARM_TORSO_TARGET = 60
+ARM_TORSO_TOL = 30  # OK range: 30..60
+
+# UI settings
+SHOW_DEBUG_TEXT = True  # set False if you want only reps + status
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
 
 # ==========================
-# PUSH-UP DETECTION HELPERS
+# GEOMETRY HELPERS
 # ==========================
+def get_joint_xy(lm, idx, w, h):
+    p = lm[idx]
+    return (p.x * w, p.y * h)
 
-# Recommended starting thresholds (tune per camera angle)
-PUSHUP_DOWN_ANGLE = 90     # elbow angle at bottom
-PUSHUP_UP_ANGLE = 160      # elbow angle at top (arms extended)
-PLANK_OK_ANGLE = 20        # torso lean limit (smaller is "more vertical" per current torso_angle def)
 
 def choose_side(lm):
-    """
-    Choose the side (left/right) with higher landmark visibility for elbow-angle measurement.
-    Returns a tuple of indices: (shoulder_idx, elbow_idx, wrist_idx, hip_idx)
-    """
+    """Pick left/right side by highest landmark visibility (shoulder + elbow + wrist)."""
     left = (
         mp_pose.PoseLandmark.LEFT_SHOULDER.value,
         mp_pose.PoseLandmark.LEFT_ELBOW.value,
@@ -34,22 +47,13 @@ def choose_side(lm):
         mp_pose.PoseLandmark.RIGHT_HIP.value,
     )
 
-    lv = (
-        lm[left[0]].visibility + lm[left[1]].visibility + lm[left[2]].visibility
-    )
-    rv = (
-        lm[right[0]].visibility + lm[right[1]].visibility + lm[right[2]].visibility
-    )
-
+    lv = lm[left[0]].visibility + lm[left[1]].visibility + lm[left[2]].visibility
+    rv = lm[right[0]].visibility + lm[right[1]].visibility + lm[right[2]].visibility
     return left if lv >= rv else right
 
 
 def compute_plank_angle(lm, w, h, use_left=True):
-    """
-    Plank indicator: angle between hip->shoulder vector and vertical axis.
-    For pushups, you may prefer "horizontal-to-ground" instead,
-    but this keeps it consistent with your torso_angle implementation.
-    """
+    """Angle between hip->shoulder vector and vertical axis (same idea as your torso angle)."""
     sh_idx = mp_pose.PoseLandmark.LEFT_SHOULDER.value if use_left else mp_pose.PoseLandmark.RIGHT_SHOULDER.value
     hip_idx = mp_pose.PoseLandmark.LEFT_HIP.value if use_left else mp_pose.PoseLandmark.RIGHT_HIP.value
 
@@ -62,17 +66,15 @@ def compute_plank_angle(lm, w, h, use_left=True):
     denom = (np.linalg.norm(v) * np.linalg.norm(vertical)) + 1e-9
     cos_theta = np.dot(v, vertical) / denom
     cos_theta = np.clip(cos_theta, -1.0, 1.0)
-    angle_deg = float(np.degrees(np.arccos(cos_theta)))
 
+    angle_deg = float(np.degrees(np.arccos(cos_theta)))
     return angle_deg, sh, hip
 
 
+# ==========================
+# LOGIC (COUNTING + CHECKS)
+# ==========================
 def update_pushup_count(elbow_angle, stage, count):
-    """
-    Stage logic:
-    - "up" -> "down" when elbow angle gets small (bottom)
-    - "down" -> "up" when elbow angle gets big again (top), count +1
-    """
     if elbow_angle < PUSHUP_DOWN_ANGLE and stage == "up":
         stage = "down"
     elif elbow_angle > PUSHUP_UP_ANGLE and stage == "down":
@@ -81,31 +83,53 @@ def update_pushup_count(elbow_angle, stage, count):
     return stage, count
 
 
-def plank_status(plank_angle):
-    ok = plank_angle < PLANK_OK_ANGLE
-    return ("Plank OK" if ok else "Plank BROKEN"), ((0, 255, 0) if ok else (0, 0, 255))
+def plank_ok(plank_angle):
+    return plank_angle < PLANK_OK_ANGLE
 
 
-def draw_pushup_overlay(frame, elbow_angle, plank_angle, reps, sh, hip, color):
-    cv2.putText(frame, f"Elbow: {int(elbow_angle)}", (10, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    cv2.putText(frame, f"Reps: {reps}", (10, 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-    cv2.putText(frame, f"Plank: {int(plank_angle)} deg", (10, 140),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-
-    cv2.line(frame,
-             (int(hip[0]), int(hip[1])),
-             (int(sh[0]), int(sh[1])),
-             color, 3)
+def arm_torso_ok(arm_torso_angle):
+    return abs(arm_torso_angle - ARM_TORSO_TARGET) <= ARM_TORSO_TOL
 
 
-def process_frame_pushups(frame, pose, stage, reps, mirror=False, draw_reps=True):
-    """
-    Similar to your process_frame() but tailored to pushups:
-    - Measures elbow angle (shoulder-elbow-wrist) on best-visible side
-    - Measures a "plank" torso angle (hip->shoulder vs vertical) as a form check
-    """
+# ==========================
+# UI (CLEAN OVERLAY)
+# ==========================
+def draw_status_panel(frame, reps, stage, plank_ok_flag, arm_ok_flag, elbow_angle=None, plank_angle=None, arm_angle=None):
+    # background panel
+    cv2.rectangle(frame, (10, 10), (360, 165 if SHOW_DEBUG_TEXT else 115), (0, 0, 0), -1)
+
+    # reps (big, clear)
+    cv2.putText(frame, f"REPS: {reps}", (20, 60), FONT, 1.6, (255, 255, 255), 3)
+
+    # stage
+    cv2.putText(frame, f"STAGE: {stage.upper()}", (20, 100), FONT, 0.9, (220, 220, 220), 2)
+
+    # form statuses (only 2 lines, color-coded)
+    plank_color = (0, 255, 0) if plank_ok_flag else (0, 0, 255)
+    arm_color = (0, 255, 0) if arm_ok_flag else (0, 0, 255)
+
+    cv2.putText(frame, "PLANK", (200, 95), FONT, 0.85, (255, 255, 255), 2)
+    cv2.putText(frame, "OK" if plank_ok_flag else "BAD", (290, 95), FONT, 0.85, plank_color, 2)
+
+    cv2.putText(frame, "ARM", (200, 130), FONT, 0.85, (255, 255, 255), 2)
+    cv2.putText(frame, "OK" if arm_ok_flag else "BAD", (290, 130), FONT, 0.85, arm_color, 2)
+
+    # optional debug angles (small, tucked away)
+    if SHOW_DEBUG_TEXT and elbow_angle is not None and plank_angle is not None and arm_angle is not None:
+        cv2.putText(frame, f"Elbow: {int(elbow_angle)}", (20, 150), FONT, 0.7, (200, 200, 200), 2)
+        cv2.putText(frame, f"Plank: {int(plank_angle)}", (140, 150), FONT, 0.7, (200, 200, 200), 2)
+        cv2.putText(frame, f"Arm: {int(arm_angle)}", (265, 150), FONT, 0.7, (200, 200, 200), 2)
+
+
+def draw_plank_line(frame, hip_pt, sh_pt, ok_flag):
+    color = (0, 255, 0) if ok_flag else (0, 0, 255)
+    cv2.line(frame, (int(hip_pt[0]), int(hip_pt[1])), (int(sh_pt[0]), int(sh_pt[1])), color, 3)
+
+
+# ==========================
+# MAIN FRAME PROCESSOR
+# ==========================
+def process_frame_pushups(frame, pose, stage, reps, mirror=False, draw_ui=True):
     if mirror:
         frame = cv2.flip(frame, 1)
 
@@ -124,34 +148,42 @@ def process_frame_pushups(frame, pose, stage, reps, mirror=False, draw_reps=True
     shoulder = get_joint_xy(lm, sh_idx, w, h)
     elbow = get_joint_xy(lm, el_idx, w, h)
     wrist = get_joint_xy(lm, wr_idx, w, h)
+    hip = get_joint_xy(lm, hip_idx, w, h)
 
+    # Angles (logic kept)
     elbow_angle = calculate_angle(shoulder, elbow, wrist)
-
     plank_angle, sh_pt, hip_pt = compute_plank_angle(lm, w, h, use_left=use_left)
+    arm_torso_angle = calculate_angle(elbow, shoulder, hip)
+
+    # Counting
     stage, reps = update_pushup_count(elbow_angle, stage, reps)
 
-    _, color = plank_status(plank_angle)
+    # Form checks
+    plank_ok_flag = plank_ok(plank_angle)
+    arm_ok_flag = arm_torso_ok(arm_torso_angle)
 
-    if draw_reps:
-        draw_pushup_overlay(frame, elbow_angle, plank_angle, reps, sh_pt, hip_pt, color)
-    else:
-        cv2.putText(frame, f"Elbow: {int(elbow_angle)}", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(frame, f"Plank: {int(plank_angle)} deg", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.line(frame,
-                 (int(hip_pt[0]), int(hip_pt[1])),
-                 (int(sh_pt[0]), int(sh_pt[1])),
-                 color, 3)
-
+    # Draw
     mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+    draw_plank_line(frame, hip_pt, sh_pt, plank_ok_flag)
+
+    if draw_ui:
+        draw_status_panel(
+            frame,
+            reps=reps,
+            stage=stage,
+            plank_ok_flag=plank_ok_flag,
+            arm_ok_flag=arm_ok_flag,
+            elbow_angle=elbow_angle,
+            plank_angle=plank_angle,
+            arm_angle=arm_torso_angle,
+        )
+
     return frame, stage, reps, results
 
 
 # ==========================
 # RUNNERS (LIVE / VIDEO / IMAGE)
 # ==========================
-
 def run_pushups_live():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -165,7 +197,7 @@ def run_pushups_live():
             if not ret:
                 break
 
-            frame, stage, reps, _ = process_frame_pushups(frame, pose, stage, reps, mirror=True, draw_reps=True)
+            frame, stage, reps, _ = process_frame_pushups(frame, pose, stage, reps, mirror=True, draw_ui=True)
             cv2.imshow("FitVisor - Live Pushups", frame)
 
             if cv2.waitKey(1) & 0xFF == 27:
@@ -188,7 +220,7 @@ def run_pushups_on_video(video_path):
             if not ret:
                 break
 
-            frame, stage, reps, _ = process_frame_pushups(frame, pose, stage, reps, mirror=False, draw_reps=True)
+            frame, stage, reps, _ = process_frame_pushups(frame, pose, stage, reps, mirror=False, draw_ui=True)
             cv2.imshow("FitVisor - Video Pushups", frame)
 
             if cv2.waitKey(1) & 0xFF == 27:
@@ -206,7 +238,7 @@ def run_pushups_on_image(image_path):
 
     with mp_pose.Pose(static_image_mode=True) as pose:
         stage, reps = "up", 0
-        image, stage, reps, results = process_frame_pushups(image, pose, stage, reps, mirror=False, draw_reps=False)
+        image, stage, reps, results = process_frame_pushups(image, pose, stage, reps, mirror=False, draw_ui=True)
 
         if results is None or not results.pose_landmarks:
             print("No person detected.")
